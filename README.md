@@ -41,6 +41,29 @@ curl -s "localhost:8080/debug/emit?sessionId=demo" -H 'content-type: application
   -d '{"type":"highlight","passageIds":["12.1"]}'
 ```
 
+## The Council, Be Odysseus and guardrails
+
+- **The Council:** every call or chat starts with just the god, no screen. Ask a real question ("Is revenge ever
+  justified?") and the screen comes up with a philosophy board: the idea at the heart of it, its emblem, and one-line
+  viewpoints from 2-3 gods (Athena, Poseidon, Zeus, Hermes, Helios, Circe, Calypso, and Odysseus as the mortal view),
+  with the grounding passage highlighted.
+- **Be Odysseus:** say "I want to be Odysseus". You make his choices at nine moments of the voyage (A, B or C, on screen
+  or out loud); your crew, Poseidon's wrath and Athena's favour change; after each pick you learn what Homer's Odysseus
+  did, with the real quote; at the end you get a title and a comparison. Data: `story/data/adventure.json`.
+- **Guardrails:** characters only discuss the Odyssey, Greek myth, its ideas, and the user's life through it. Text mode
+  also blocks obvious off-topic requests (arithmetic, code, weather, prices...) before the model (`brain/src/guardrails.ts`).
+- Demos without Gemini: `curl -X POST "localhost:8080/debug/demo?sessionId=demo&script=council"` (or `script=adventure`).
+
+## Character styles and Story Mode
+
+- **Character styles:** open `http://localhost:3000/characters` to compare five styles (red-figure, black-figure,
+  marble, Minoan fresco, storybook), talking and gesturing. Switch with
+  `npm run art -w stage -- --use <style> --only characters` (saved in `assets/characters/style.json`).
+- **Story Mode:** ask any character to tell part of the story ("Odysseus, what was it like inside the wooden horse?").
+  They narrate it in beats, each with a large illustration, a hand gesture and the passage highlighted. Moments live in
+  `story/data/moments.json`, illustrations in `assets/illustrations/`. Try it without Gemini:
+  `curl -X POST "localhost:8080/debug/demo?sessionId=demo&script=story"`.
+
 ## Daily git loop
 
 ```bash

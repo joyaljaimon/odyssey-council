@@ -1,6 +1,7 @@
 // Per-session memory (in process only, per the MVP: nothing is persisted).
 import type { Content } from "@google/genai";
 import type { CharacterId, SessionSummary } from "@odyssey/contracts";
+import type { AdventureState } from "./adventure.ts";
 
 export type Session = {
   id: string;
@@ -9,6 +10,8 @@ export type Session = {
   transcript: { who: CharacterId | "user"; text: string }[]; // both modes; used for handover summaries
   disclosed: boolean; // has the agent said it is an AI yet
   summary: SessionSummary;
+  story?: { momentId?: string }; // Story Mode on when set
+  adventure?: AdventureState; // Be Odysseus in progress
   lastActive: number;
 };
 

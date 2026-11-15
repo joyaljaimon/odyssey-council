@@ -4,7 +4,8 @@
 //   WS   /stage?sessionId=...       -> StageEvent JSON     (Stage page)
 //   GET  /session?sessionId=...     -> SessionSummary      (Stage /card)
 //   POST /debug/emit?sessionId=...  -> forwards a StageEvent to the stage (testing only)
-//   POST /debug/demo?sessionId=...  -> plays a scripted demo conversation on the stage (no Gemini needed)
+//   POST /debug/demo?sessionId=...  -> plays a scripted demo conversation on the stage (no Gemini needed);
+//                                      &script=story | council | adventure for Story Mode, the Council, Be Odysseus
 // Without GEMINI_API_KEY, /text runs a scripted offline Athena and /voice stays silent.
 import http from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
@@ -44,7 +45,8 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (url.pathname === "/debug/demo") {
-      void playDemo(url.searchParams.get("sessionId") ?? "demo");
+      const script = url.searchParams.get("script");
+      void playDemo(url.searchParams.get("sessionId") ?? "demo", script === "story" || script === "council" || script === "adventure" ? script : "conversation");
       res.writeHead(202).end("demo started");
       return;
     }
