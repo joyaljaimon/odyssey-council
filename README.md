@@ -41,6 +41,32 @@ curl -s "localhost:8080/debug/emit?sessionId=demo" -H 'content-type: application
   -d '{"type":"highlight","passageIds":["12.1"]}'
 ```
 
+## Three modes
+
+Every call or chat starts at a menu: the god, and three cards on the screen (clickable on the web stage; on a call or
+over text, just say which):
+
+| Mode | What happens on the screen |
+| --- | --- |
+| **Be Odysseus** | You make Odysseus' choices at nine moments of the voyage (A/B/C). Crew, Poseidon's wrath and Athena's favour change; after each pick you see what Homer's Odysseus did, with the real quote; at the end you get a title. |
+| **The Council** | Philosophy and the story, explained by the gods: a board with the idea, its emblem and 2-3 gods' viewpoints; Story Mode for "tell me about…" (illustrations, gestures, highlighted passages); a debate between gods. |
+| **Talk about life** | Your own problem: the matching episode's scene, map and key passage, and a "Your Ithaca" takeaway card. |
+
+Say "menu" (or tap) to switch. Each mode gives the model only its own instructions and tools. Guardrails: characters
+only discuss the Odyssey, Greek myth, its ideas and your life through it; text also pre-filters obvious off-topic
+requests (`brain/src/guardrails.ts`). Demos without Gemini:
+`curl -X POST "localhost:8080/debug/demo?sessionId=demo&script=adventure"` (or `council`, `story`).
+
+## Character styles and Story Mode
+
+- **Character styles:** open `http://localhost:3000/characters` to compare five styles (red-figure, black-figure,
+  marble, Minoan fresco, storybook), talking and gesturing. Switch with
+  `npm run art -w stage -- --use <style> --only characters` (saved in `assets/characters/style.json`).
+- **Story Mode:** ask any character to tell part of the story ("Odysseus, what was it like inside the wooden horse?").
+  They narrate it in beats, each with a large illustration, a hand gesture and the passage highlighted. Moments live in
+  `story/data/moments.json`, illustrations in `assets/illustrations/`. Try it without Gemini:
+  `curl -X POST "localhost:8080/debug/demo?sessionId=demo&script=story"`.
+
 ## Daily git loop
 
 ```bash
