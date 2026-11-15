@@ -3,24 +3,24 @@
 //   Brain -> Channel: JSON { type: "interrupted" } (drop queued audio) and { type: "ended" } (hang up)
 // Mouth events are scheduled against a playback clock, so the stage mouth moves when the audio is heard,
 // not when it arrives (Gemini sends audio faster than real time).
-import { Modality, type LiveServerMessage, type Session as LiveSession } from "@google/genai";
+import { EndSensitivity, Modality, StartSensitivity, type LiveServerMessage, type Session as LiveSession } from "@google/genai";
 import type { WebSocket } from "ws";
 import {
   AGENT_AUDIO_SAMPLE_RATE, USER_AUDIO_SAMPLE_RATE,
-  type CharacterId, type StageEvent, type VoiceControlMessage,
+  type AppMode, type CharacterId, type StageEvent, type VoiceControlMessage,
 } from "@odyssey/contracts";
 import { getCharacter } from "@odyssey/story";
-import { systemPrompt, voiceFor } from "./persona.ts";
+import { MODE_NAMES, systemPrompt, voiceFor } from "./persona.ts";
 import { getSession, recap, type Session } from "./session.ts";
 import { emit, mouthLevel } from "./stage.ts";
 import { gemini } from "./text.ts";
-import { functionDeclarations, runTool } from "./tools.ts";
+import { modeEvents, runTool, toolsFor } from "./tools.ts";
 
 export const LIVE_MODEL = process.env.GEMINI_LIVE_MODEL ?? "gemini-3.8-live";
 export const MOUTH_EVENT_MS = 50;
 const BYTES_PER_MS = (AGENT_AUDIO_SAMPLE_RATE * 2) / 1000; // PCM16 mono
 
-type After = { kind: "switch"; to: CharacterId } | { kind: "debate"; topic: string } | { kind: "end" };
+type After = { kind: "switch"; to: CharacterId } | { kind: "debate"; topic: string } | { kind: "end" } | { kind: "mode" };
 
 class Call {
   private live: LiveSession | null = null;
@@ -32,6 +32,12 @@ class Call {
   private busy = false; // switching or debating: ignore caller audio
   private closed = false;
   private turnDone: (() => void) | null = null;
+  // Screens queued after a tool call (e.g. the next "Be Odysseus" decision). Kept apart from the speech-synced timers,
+  // which are cleared when the caller talks: these must never be dropped, only shown early.
+  private later: StageEvent[] = [];
+  private spokeSinceLater = false; // the turn-end rule only counts once the character has narrated the outcome
+  private spokenMsSinceLater = 0; // speech since the queued screen; at ~9 s (outcome + Homer told) the next one shows
+  private laterTimer: NodeJS.Timeout | null = null;
 
   constructor(private s: Session, private ws: WebSocket) {}
 
@@ -43,6 +49,8 @@ class Call {
       else this.control(String(data));
     });
     this.ws.on("close", () => this.close());
+    // Each call starts with just the god on stage: no screen until there is something to show.
+    this.stage({ type: "clear" });
     this.stage({ type: "character", character: this.s.character });
     await this.open(this.s.character, { firstTurn: !this.s.disclosed });
     this.prompt("(The FaceTime call has just connected. Greet the caller now.)");
@@ -57,12 +65,22 @@ class Call {
       model: LIVE_MODEL,
       config: {
         responseModalities: [Modality.AUDIO],
-        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceFor(character) } } },
-        systemInstruction: systemPrompt(character, "voice", opts),
-        tools: [{ functionDeclarations }],
+        // English only: without a language code the native-audio model follows whatever language it thinks it hears.
+        speechConfig: { languageCode: "en-US", voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceFor(character) } } },
+        systemInstruction: systemPrompt(character, "voice", { ...opts, appMode: this.s.mode }),
+        tools: [{ functionDeclarations: toolsFor(this.s.mode) }],
         inputAudioTranscription: {},
         outputAudioTranscription: {},
         contextWindowCompression: { slidingWindow: {} },
+        // Latency: answer once the caller has been quiet for a short moment (the default waits noticeably longer).
+        realtimeInputConfig: {
+          automaticActivityDetection: {
+            startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
+            endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
+            prefixPaddingMs: 100,
+            silenceDurationMs: Number(process.env.LIVE_SILENCE_MS ?? 450),
+          },
+        },
       },
       callbacks: {
         onmessage: (m) => void this.onMessage(m),
@@ -77,6 +95,7 @@ class Call {
     if (this.closed) return;
     this.closed = true;
     this.clearTimers();
+    if (this.laterTimer) clearTimeout(this.laterTimer);
     this.live?.close();
     this.stage({ type: "mouth", character: this.s.character, level: 0 });
     console.log(`[voice ${this.s.id}] call closed`);
@@ -128,6 +147,15 @@ class Call {
   }
 
   private playAudio(pcm: Buffer) {
+    this.spokeSinceLater = true;
+    if (this.later.length) {
+      const before = this.spokenMsSinceLater;
+      this.spokenMsSinceLater += pcm.length / BYTES_PER_MS;
+      // Once the outcome and Homer's choice have been told (~9 s of speech), move the screen on as she reaches the
+      // next scenario: show it at the moment that audio is heard.
+      const at = Number(process.env.ADVENTURE_NEXT_AFTER_MS ?? 9000);
+      if (before < at && this.spokenMsSinceLater >= at) this.queueLater([], Math.max(0, this.playhead - Date.now()) + (at - before));
+    }
     if (this.ws.readyState === this.ws.OPEN) this.ws.send(pcm, { binary: true });
     // Schedule one mouth event per 50 ms of audio, at the moment it will be heard.
     const now = Date.now();
@@ -142,6 +170,7 @@ class Call {
 
   private interrupt() {
     this.clearTimers();
+    this.flushLater(); // the caller is talking: show the queued screen now rather than lose it
     this.playhead = 0;
     this.send({ type: "interrupted" });
     this.stage({ type: "mouth", character: this.s.character, level: 0 });
@@ -150,6 +179,8 @@ class Call {
 
   private async onTurnComplete() {
     this.at(this.playhead, () => this.stage({ type: "mouth", character: this.s.character, level: 0 }));
+    // After the turn that narrated the outcome is heard (Gemini also ends a turn right at the tool call: ignore that one).
+    if (this.later.length && this.spokeSinceLater) this.queueLater([], Math.max(0, this.playhead - Date.now()) + 300);
     this.finishTurnText();
     this.turnDone?.();
     const after = this.after;
@@ -157,6 +188,7 @@ class Call {
     if (!after) return;
     await this.waitForPlayback();
     if (after.kind === "switch") await this.switchTo(after.to);
+    else if (after.kind === "mode") await this.reopenForMode("(You have just switched into this mode; it is already active, so do not call choose_mode. Start it now, as your instructions for this mode say.)");
     else if (after.kind === "debate") await this.debate(after.topic);
     else {
       this.send({ type: "ended" });
@@ -165,7 +197,10 @@ class Call {
   }
 
   private finishTurnText() {
-    if (this.userText.trim()) this.s.transcript.push({ who: "user", text: this.userText.trim() });
+    if (this.userText.trim()) {
+      this.s.transcript.push({ who: "user", text: this.userText.trim() });
+      console.log(`[voice ${this.s.id}] heard: "${this.userText.trim().slice(0, 120)}"`);
+    }
     if (this.turnText.trim()) this.s.transcript.push({ who: this.s.character, text: this.turnText.trim() });
     this.userText = "";
     this.turnText = "";
@@ -174,12 +209,16 @@ class Call {
   private async onToolCall(calls: { id?: string; name?: string; args?: Record<string, unknown> }[]) {
     const functionResponses = [];
     for (const call of calls) {
+      console.log(`[voice ${this.s.id}] tool ${call.name} ${JSON.stringify(call.args ?? {}).slice(0, 160)}`);
       const out = await runTool(this.s, call.name ?? "", call.args ?? {});
       // Visuals land when the character reaches this point in its speech.
       for (const e of out.events) this.at(this.playhead, () => this.stage(e));
+      // e.g. the next "Be Odysseus" decision: after the outcome and Homer's choice have been told (~12 s)
+      if (out.later?.length) { this.spokeSinceLater = false; this.spokenMsSinceLater = 0; this.queueLater(out.later, 25000); }
       if (out.switchTo && out.switchTo !== this.s.character) this.after = { kind: "switch", to: out.switchTo };
       if (out.debateTopic) this.after = { kind: "debate", topic: out.debateTopic };
       if (out.ended) this.after = { kind: "end" };
+      if (out.modeChanged && !this.after) this.after = { kind: "mode" };
       functionResponses.push({ id: call.id, name: call.name, response: out.response });
     }
     this.live?.sendToolResponse({ functionResponses });
@@ -192,7 +231,29 @@ class Call {
     this.stage({ type: "character", character: to });
     await this.open(to, { firstTurn: false, summary: recap(this.s) });
     this.busy = false;
-    this.prompt("(You have just taken over the call. Greet the caller briefly by name and continue.)");
+    this.prompt("(You have just taken over the call from another character, because the caller asked for you. You are already active: do not call switch_character. Greet the caller in one short line by your name, then carry on with what they asked.)");
+  }
+
+  /** A Live session's prompt and tools are fixed, so a new mode means a new session (same voice, with a recap). */
+  private reopens: number[] = [];
+  async reopenForMode(prompt: string) {
+    // Circuit breaker: never restart the session in a loop (the caller would be ignored while it reopens).
+    const now = Date.now();
+    this.reopens = this.reopens.filter((t) => now - t < 20000);
+    if (this.reopens.length >= 3) { console.warn(`[voice ${this.s.id}] too many mode switches; staying in the current session`); return; }
+    this.reopens.push(now);
+    this.busy = true;
+    await this.open(this.s.character, { firstTurn: false, summary: recap(this.s) });
+    this.busy = false;
+    this.prompt(prompt);
+  }
+
+  /** The user tapped a mode card on the stage page. */
+  async tappedMode(mode: AppMode | undefined) {
+    if (mode === this.s.mode) return;
+    for (const e of modeEvents(this.s, mode)) this.stage(e);
+    this.interrupt();
+    await this.reopenForMode(mode ? `(The user just tapped "${MODE_NAMES[mode]}" on the screen. Start that mode now.)` : "(The user went back to the menu. Offer the three choices again.)");
   }
 
   /** Odysseus (left) and Poseidon (right) each speak twice, then Athena returns and asks the caller to pick. */
@@ -225,6 +286,23 @@ class Call {
     this.timers.add(t);
   }
 
+  /** Queue screens to show at most `ms` from now (sooner if the turn ends or the caller talks). */
+  private queueLater(events: StageEvent[], ms = 10000) {
+    this.later.push(...events);
+    const due = Date.now() + ms;
+    if (this.laterTimer && (this.laterTimer as unknown as { _due?: number })._due! <= due) return;
+    if (this.laterTimer) clearTimeout(this.laterTimer);
+    this.laterTimer = setTimeout(() => this.flushLater(), ms);
+    (this.laterTimer as unknown as { _due?: number })._due = due;
+  }
+
+  private flushLater() {
+    if (this.laterTimer) { clearTimeout(this.laterTimer); this.laterTimer = null; }
+    const events = this.later;
+    this.later = [];
+    for (const e of events) this.stage(e);
+  }
+
   private clearTimers() {
     for (const t of this.timers) clearTimeout(t);
     this.timers.clear();
@@ -234,6 +312,9 @@ class Call {
     return new Promise<void>((r) => setTimeout(r, Math.max(0, this.playhead - Date.now()) + 300));
   }
 }
+
+const calls = new Map<string, Call>();
+export const activeCall = (sessionId: string) => calls.get(sessionId);
 
 export function handleVoice(sessionId: string, ws: WebSocket) {
   console.log(`[voice] session ${sessionId} connected`);
@@ -245,7 +326,10 @@ export function handleVoice(sessionId: string, ws: WebSocket) {
     ws.on("message", () => {});
     return;
   }
-  new Call(s, ws).start().catch((err) => {
+  const call = new Call(s, ws);
+  calls.set(sessionId, call);
+  ws.on("close", () => { if (calls.get(sessionId) === call) calls.delete(sessionId); });
+  call.start().catch((err) => {
     console.error(`[voice ${sessionId}] failed to start`, err);
     ws.close(1011, "live session failed");
   });

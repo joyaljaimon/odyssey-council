@@ -7,3 +7,7 @@ dist/
 .DS_Store
 story/raw/*.txt
 *.tsbuildinfo
+
+# AI art prototypes (large); regenerate with assets/tools/style-proposals.mjs
+assets/style-proposals/
+assets/styles/
