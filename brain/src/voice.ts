@@ -3,24 +3,24 @@
 //   Brain -> Channel: JSON { type: "interrupted" } (drop queued audio) and { type: "ended" } (hang up)
 // Mouth events are scheduled against a playback clock, so the stage mouth moves when the audio is heard,
 // not when it arrives (Gemini sends audio faster than real time).
-import { Modality, type LiveServerMessage, type Session as LiveSession } from "@google/genai";
+import { EndSensitivity, Modality, StartSensitivity, type LiveServerMessage, type Session as LiveSession } from "@google/genai";
 import type { WebSocket } from "ws";
 import {
   AGENT_AUDIO_SAMPLE_RATE, USER_AUDIO_SAMPLE_RATE,
-  type CharacterId, type StageEvent, type VoiceControlMessage,
+  type AppMode, type CharacterId, type StageEvent, type VoiceControlMessage,
 } from "@odyssey/contracts";
 import { getCharacter } from "@odyssey/story";
-import { systemPrompt, voiceFor } from "./persona.ts";
+import { MODE_NAMES, systemPrompt, voiceFor } from "./persona.ts";
 import { getSession, recap, type Session } from "./session.ts";
 import { emit, mouthLevel } from "./stage.ts";
 import { gemini } from "./text.ts";
-import { functionDeclarations, runTool } from "./tools.ts";
+import { modeEvents, runTool, toolsFor } from "./tools.ts";
 
 export const LIVE_MODEL = process.env.GEMINI_LIVE_MODEL ?? "gemini-3.8-live";
 export const MOUTH_EVENT_MS = 50;
 const BYTES_PER_MS = (AGENT_AUDIO_SAMPLE_RATE * 2) / 1000; // PCM16 mono
 
-type After = { kind: "switch"; to: CharacterId } | { kind: "debate"; topic: string } | { kind: "end" };
+type After = { kind: "switch"; to: CharacterId } | { kind: "debate"; topic: string } | { kind: "end" } | { kind: "mode" };
 
 class Call {
   private live: LiveSession | null = null;
@@ -43,6 +43,8 @@ class Call {
       else this.control(String(data));
     });
     this.ws.on("close", () => this.close());
+    // Each call starts with just the god on stage: no screen until there is something to show.
+    this.stage({ type: "clear" });
     this.stage({ type: "character", character: this.s.character });
     await this.open(this.s.character, { firstTurn: !this.s.disclosed });
     this.prompt("(The FaceTime call has just connected. Greet the caller now.)");
@@ -57,12 +59,22 @@ class Call {
       model: LIVE_MODEL,
       config: {
         responseModalities: [Modality.AUDIO],
-        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceFor(character) } } },
-        systemInstruction: systemPrompt(character, "voice", opts),
-        tools: [{ functionDeclarations }],
+        // English only: without a language code the native-audio model follows whatever language it thinks it hears.
+        speechConfig: { languageCode: "en-US", voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceFor(character) } } },
+        systemInstruction: systemPrompt(character, "voice", { ...opts, appMode: this.s.mode }),
+        tools: [{ functionDeclarations: toolsFor(this.s.mode) }],
         inputAudioTranscription: {},
         outputAudioTranscription: {},
         contextWindowCompression: { slidingWindow: {} },
+        // Latency: answer once the caller has been quiet for a short moment (the default waits noticeably longer).
+        realtimeInputConfig: {
+          automaticActivityDetection: {
+            startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
+            endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
+            prefixPaddingMs: 100,
+            silenceDurationMs: Number(process.env.LIVE_SILENCE_MS ?? 450),
+          },
+        },
       },
       callbacks: {
         onmessage: (m) => void this.onMessage(m),
@@ -157,6 +169,7 @@ class Call {
     if (!after) return;
     await this.waitForPlayback();
     if (after.kind === "switch") await this.switchTo(after.to);
+    else if (after.kind === "mode") await this.reopenForMode("(You have just switched into this mode; it is already active, so do not call choose_mode. Start it now, as your instructions for this mode say.)");
     else if (after.kind === "debate") await this.debate(after.topic);
     else {
       this.send({ type: "ended" });
@@ -174,12 +187,16 @@ class Call {
   private async onToolCall(calls: { id?: string; name?: string; args?: Record<string, unknown> }[]) {
     const functionResponses = [];
     for (const call of calls) {
+      console.log(`[voice ${this.s.id}] tool ${call.name} ${JSON.stringify(call.args ?? {}).slice(0, 160)}`);
       const out = await runTool(this.s, call.name ?? "", call.args ?? {});
       // Visuals land when the character reaches this point in its speech.
       for (const e of out.events) this.at(this.playhead, () => this.stage(e));
+      // e.g. the next "Be Odysseus" decision: after the outcome and Homer's choice have been told (~12 s)
+      for (const e of out.later ?? []) this.at(Math.max(this.playhead, Date.now()) + 12000, () => this.stage(e));
       if (out.switchTo && out.switchTo !== this.s.character) this.after = { kind: "switch", to: out.switchTo };
       if (out.debateTopic) this.after = { kind: "debate", topic: out.debateTopic };
       if (out.ended) this.after = { kind: "end" };
+      if (out.modeChanged && !this.after) this.after = { kind: "mode" };
       functionResponses.push({ id: call.id, name: call.name, response: out.response });
     }
     this.live?.sendToolResponse({ functionResponses });
@@ -193,6 +210,28 @@ class Call {
     await this.open(to, { firstTurn: false, summary: recap(this.s) });
     this.busy = false;
     this.prompt("(You have just taken over the call. Greet the caller briefly by name and continue.)");
+  }
+
+  /** A Live session's prompt and tools are fixed, so a new mode means a new session (same voice, with a recap). */
+  private reopens: number[] = [];
+  async reopenForMode(prompt: string) {
+    // Circuit breaker: never restart the session in a loop (the caller would be ignored while it reopens).
+    const now = Date.now();
+    this.reopens = this.reopens.filter((t) => now - t < 20000);
+    if (this.reopens.length >= 3) { console.warn(`[voice ${this.s.id}] too many mode switches; staying in the current session`); return; }
+    this.reopens.push(now);
+    this.busy = true;
+    await this.open(this.s.character, { firstTurn: false, summary: recap(this.s) });
+    this.busy = false;
+    this.prompt(prompt);
+  }
+
+  /** The user tapped a mode card on the stage page. */
+  async tappedMode(mode: AppMode | undefined) {
+    if (mode === this.s.mode) return;
+    for (const e of modeEvents(this.s, mode)) this.stage(e);
+    this.interrupt();
+    await this.reopenForMode(mode ? `(The user just tapped "${MODE_NAMES[mode]}" on the screen. Start that mode now.)` : "(The user went back to the menu. Offer the three choices again.)");
   }
 
   /** Odysseus (left) and Poseidon (right) each speak twice, then Athena returns and asks the caller to pick. */
@@ -235,6 +274,9 @@ class Call {
   }
 }
 
+const calls = new Map<string, Call>();
+export const activeCall = (sessionId: string) => calls.get(sessionId);
+
 export function handleVoice(sessionId: string, ws: WebSocket) {
   console.log(`[voice] session ${sessionId} connected`);
   const s = getSession(sessionId);
@@ -245,7 +287,10 @@ export function handleVoice(sessionId: string, ws: WebSocket) {
     ws.on("message", () => {});
     return;
   }
-  new Call(s, ws).start().catch((err) => {
+  const call = new Call(s, ws);
+  calls.set(sessionId, call);
+  ws.on("close", () => { if (calls.get(sessionId) === call) calls.delete(sessionId); });
+  call.start().catch((err) => {
     console.error(`[voice ${sessionId}] failed to start`, err);
     ws.close(1011, "live session failed");
   });
